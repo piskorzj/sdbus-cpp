@@ -81,6 +81,8 @@ namespace sdbus {
         */
         virtual void enterProcessingLoopAsync() = 0;
 
+	virtual bool processEvents() = 0;
+	virtual int eventDescriptor() = 0;
         /*!
         * @brief Leaves the D-Bus processing loop
         *

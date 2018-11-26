@@ -29,7 +29,7 @@
 #include "ScopeGuard.h"
 #include <systemd/sd-bus.h>
 #include <unistd.h>
-#include <poll.h>
+#include <sys/epoll.h>
 #include <sys/eventfd.h>
 
 namespace sdbus { namespace internal {
@@ -42,13 +42,42 @@ Connection::Connection(Connection::BusType type)
 
     finishHandshake(bus);
 
+    pollFd_ = epoll_create1(0); 
     notificationFd_ = createLoopNotificationDescriptor();
+
+    assert(bus != nullptr);
+    assert(notificationFd_ != 0);
+
+    auto r = sd_bus_get_fd(bus);
+    SDBUS_THROW_ERROR_IF(r < 0, "Failed to get bus descriptor", -r);
+    auto sdbusFd = r;
+
+    r = sd_bus_get_events(bus);
+    SDBUS_THROW_ERROR_IF(r < 0, "Failed to get bus events", -r);
+    unsigned int sdbusEvents = r;
+
+    struct epoll_event ev{};
+
+    {
+	ev.events = sdbusEvents;
+	ev.data.fd = sdbusFd;
+        r = epoll_ctl(pollFd_, EPOLL_CTL_ADD, sdbusFd, &ev);
+        SDBUS_THROW_ERROR_IF(r < 0, "Failed to add bus event to poller", errno);
+    }
+
+    {
+	ev.events = EPOLLIN;
+	ev.data.fd = notificationFd_;
+        r = epoll_ctl(pollFd_, EPOLL_CTL_ADD, notificationFd_, &ev);
+        SDBUS_THROW_ERROR_IF(r < 0, "Failed to add notification to poller", errno);
+    }
 }
 
 Connection::~Connection()
 {
     leaveProcessingLoop();
     closeLoopNotificationDescriptor(notificationFd_);
+    close(pollFd_);
 }
 
 void Connection::requestName(const std::string& name)
@@ -62,21 +91,23 @@ void Connection::releaseName(const std::string& name)
     auto r = sd_bus_release_name(bus_.get(), name.c_str());
     SDBUS_THROW_ERROR_IF(r < 0, "Failed to release bus name", -r);
 }
+int Connection::eventDescriptor() {
+	return pollFd_;
+}
 
-void Connection::enterProcessingLoop()
-{
-    while (true)
-    {
-        auto processed = processPendingRequest();
-        if (processed)
-            continue; // Process next one
-
+bool Connection::processEvents() {
         auto success = waitForNextRequest();
         if (!success)
-            break; // Exit processing loop
+            return false; // Exit processing loop
         if (success.asyncMsgsToProcess)
             processAsynchronousMessages();
-    }
+
+	while(processPendingRequest());
+	return true;
+}
+void Connection::enterProcessingLoop()
+{
+    while (processEvents());
 }
 
 void Connection::enterProcessingLoopAsync()
@@ -267,6 +298,22 @@ bool Connection::processPendingRequest()
 
     SDBUS_THROW_ERROR_IF(r < 0, "Failed to process bus requests", -r);
 
+    {
+	    auto r = sd_bus_get_fd(bus);
+	    SDBUS_THROW_ERROR_IF(r < 0, "Failed to get bus descriptor", -r);
+	    auto sdbusFd = r;
+
+	    r = sd_bus_get_events(bus);
+	    SDBUS_THROW_ERROR_IF(r < 0, "Failed to get bus events", -r);
+	    unsigned int sdbusEvents = r;
+
+	    struct epoll_event ev{};
+	    ev.events = sdbusEvents;
+	    ev.data.fd = sdbusFd;
+	    r = epoll_ctl(pollFd_, EPOLL_CTL_MOD, sdbusFd, &ev);
+	    SDBUS_THROW_ERROR_IF(r < 0, "Failed to add bus event to poller", errno);
+    }
+
     return r > 0;
 }
 
@@ -288,39 +335,30 @@ Connection::WaitResult Connection::waitForNextRequest()
     assert(bus != nullptr);
     assert(notificationFd_ != 0);
 
-    auto r = sd_bus_get_fd(bus);
-    SDBUS_THROW_ERROR_IF(r < 0, "Failed to get bus descriptor", -r);
-    auto sdbusFd = r;
-
-    r = sd_bus_get_events(bus);
-    SDBUS_THROW_ERROR_IF(r < 0, "Failed to get bus events", -r);
-    short int sdbusEvents = r;
-
     uint64_t usec;
     sd_bus_get_timeout(bus, &usec);
 
-    struct pollfd fds[] = {{sdbusFd, sdbusEvents, 0}, {notificationFd_, POLLIN, 0}};
-    auto fdsCount = sizeof(fds)/sizeof(fds[0]);
-
-    r = poll(fds, fdsCount, usec == (uint64_t) -1 ? -1 : (usec+999)/1000);
+    struct epoll_event events[5];
+    int r = epoll_wait(pollFd_, events, 5, usec == (uint64_t) -1 ? -1 : (usec+999)/1000);
 
     if (r < 0 && errno == EINTR)
         return {true, false}; // Try again
 
     SDBUS_THROW_ERROR_IF(r < 0, "Failed to wait on the bus", -errno);
 
-    if (fds[1].revents & POLLIN)
-    {
-        if (exitLoopThread_)
-            return {false, false}; // Got exit notification
+    for(int i = 0; i < r; i++) {
+        if(events[i].data.fd == notificationFd_ && events[i].events & EPOLLIN) {
+		if (exitLoopThread_)
+		    return {false, false}; // Got exit notification
 
-        // Otherwise we have some async messages to process
+		// Otherwise we have some async messages to process
 
-        uint64_t value{};
-        auto r = read(notificationFd_, &value, sizeof(value));
-        SDBUS_THROW_ERROR_IF(r < 0, "Failed to read from the event descriptor", -errno);
+		uint64_t value{};
+		auto r = read(notificationFd_, &value, sizeof(value));
+		SDBUS_THROW_ERROR_IF(r < 0, "Failed to read from the event descriptor", -errno);
 
-        return {false, true};
+		return {false, true};
+	}
     }
 
     return {true, false};

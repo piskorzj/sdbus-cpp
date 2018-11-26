@@ -57,6 +57,8 @@ namespace sdbus { namespace internal {
         void enterProcessingLoop() override;
         void enterProcessingLoopAsync() override;
         void leaveProcessingLoop() override;
+	bool processEvents() override;
+	int eventDescriptor() override;
 
         void* addObjectVTable( const std::string& objectPath
                              , const std::string& interfaceName
@@ -113,6 +115,7 @@ namespace sdbus { namespace internal {
         std::mutex mutex_;
         std::queue<MethodReply> asyncReplies_;
         std::atomic<bool> exitLoopThread_;
+	int pollFd_{-1};
         int notificationFd_{-1};
         BusType busType_;
 
